@@ -27,6 +27,11 @@ def decode_positions(req: DecodeRequest) -> dict:
     results: list[dict] = []
     ok_count = 0
     error_count = 0
+    max_gs = (
+        req.motion_guard.max_ground_speed_kt
+        if req.motion_guard is not None
+        else None
+    )
 
     # 逐组独立裁决：任何一组失败都不影响同批其他组
     for pair in req.pairs:
@@ -36,6 +41,7 @@ def decode_positions(req: DecodeRequest) -> dict:
                 pair.frame1.received_at_ms,
                 pair.frame2.raw_hex,
                 pair.frame2.received_at_ms,
+                max_ground_speed_kt=max_gs,
             )
         except ModesError as exc:
             error_count += 1
@@ -75,17 +81,22 @@ def decode_positions(req: DecodeRequest) -> dict:
             elif lon < -180.0:
                 lon += 360.0
             lon += 0.0
+            result = {
+                "icao": f"{pos.icao:06X}",
+                "latitude": lat,
+                "longitude": lon,
+                "newer_frame": pos.newer_frame,
+                "time_delta_ms": pos.time_delta_ms,
+            }
+            if max_gs is not None:
+                # 仅展示层保留三位小数；阈值裁决在 modes 层用未舍入值完成
+                result["distance_nm"] = round(pos.distance_nm, 3) + 0.0
+                result["ground_speed_kt"] = round(pos.ground_speed_kt, 3) + 0.0
             results.append(
                 {
                     "id": pair.id,
                     "status": "ok",
-                    "result": {
-                        "icao": f"{pos.icao:06X}",
-                        "latitude": lat,
-                        "longitude": lon,
-                        "newer_frame": pos.newer_frame,
-                        "time_delta_ms": pos.time_delta_ms,
-                    },
+                    "result": result,
                 }
             )
 

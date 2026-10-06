@@ -11,7 +11,7 @@ python -m pytest -q
 echo "== [2/3] 等待 API 健康检查通过：$BASE_URL/health =="
 python scripts/wait_health.py "$BASE_URL"
 
-echo "== [3/3] 接口冒烟（有效报文 + 坏 CRC） =="
+echo "== [3/3] 接口冒烟（兼容回归 + 运动守卫正常运动/超限/跨日期变更线） =="
 python scripts/smoke.py "$BASE_URL"
 
 echo "== verify 全部通过，退出码 0 =="

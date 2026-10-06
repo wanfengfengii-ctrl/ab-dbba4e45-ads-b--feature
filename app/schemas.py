@@ -6,6 +6,8 @@ from typing import Annotated, Literal, Union
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 MAX_PAIRS = 200
+MIN_GROUND_SPEED_KT = 1
+MAX_GROUND_SPEED_KT = 2000
 
 PairId = Annotated[Union[str, int], Field(union_mode="left_to_right")]
 
@@ -30,8 +32,26 @@ class PairIn(BaseModel):
     frame2: FrameIn
 
 
+class MotionGuardIn(BaseModel):
+    """可选运动守卫：按两帧各自位置核算最短地表位移与地速。"""
+
+    max_ground_speed_kt: int = Field(
+        ...,
+        ge=MIN_GROUND_SPEED_KT,
+        le=MAX_GROUND_SPEED_KT,
+        description=(
+            "地速上限（节），1..2000；与阈值相等视为通过。"
+            "两帧同刻无法计时时该组返回 MOTION_TIME_UNRESOLVED，"
+            "超过上限返回 MOTION_LIMIT_EXCEEDED"
+        ),
+    )
+
+
 class DecodeRequest(BaseModel):
     pairs: list[PairIn] = Field(..., min_length=1, max_length=MAX_PAIRS)
+    motion_guard: MotionGuardIn | None = Field(
+        None, description="省略时请求、响应与错误语义保持不变"
+    )
 
     @model_validator(mode="after")
     def _unique_ids(self) -> "DecodeRequest":
@@ -57,6 +77,13 @@ class PositionResult(BaseModel):
     longitude: float
     newer_frame: Literal[1, 2] = Field(..., description="位置取自的较新帧")
     time_delta_ms: int
+    # 仅在请求启用 motion_guard 且该组通过时出现
+    distance_nm: float | None = Field(
+        None, description="两帧位置间最短地表位移（海里），保留三位小数"
+    )
+    ground_speed_kt: float | None = Field(
+        None, description="两帧间平均地速（节），保留三位小数"
+    )
 
 
 class PairResult(BaseModel):

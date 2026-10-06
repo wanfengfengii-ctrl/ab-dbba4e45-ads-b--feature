@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.main import app  # noqa: E402
-from tests.encoding import make_pair  # noqa: E402
+from tests.encoding import make_moving_pair, make_pair  # noqa: E402
 
 client = TestClient(app)
 T0 = 1_700_000_000_000
@@ -22,6 +22,17 @@ def _pair_payload(pid, lat=39.9, lon=116.4, t=T0, icao=0x780A1B):
         "id": pid,
         "frame1": {"received_at_ms": t1, "raw_hex": h1},
         "frame2": {"received_at_ms": t2, "raw_hex": h2},
+    }
+
+
+def _moving_payload(pid, lat1, lon1, lat2, lon2, t1=T0, t2=T0 + 1000, icao=0x780A1B):
+    (ta, h1), (tb, h2) = make_moving_pair(
+        lat1, lon1, lat2, lon2, icao=icao, t_even_ms=t1, t_odd_ms=t2
+    )
+    return {
+        "id": pid,
+        "frame1": {"received_at_ms": ta, "raw_hex": h1},
+        "frame2": {"received_at_ms": tb, "raw_hex": h2},
     }
 
 
@@ -140,3 +151,142 @@ def test_batch_of_200_performance_and_isolation():
     body = r.json()
     assert body["ok_count"] == 199 and body["error_count"] == 1
     assert len(body["results"]) == 200
+
+
+# --- 运动守卫 motion_guard ------------------------------------------------
+
+def test_motion_guard_omitted_response_unchanged():
+    """省略 motion_guard 时请求、响应与错误语义保持不变。"""
+    r = client.post(
+        "/api/adsb/positions/decode", json={"pairs": [_pair_payload("p1")]}
+    )
+    assert r.status_code == 200
+    res = r.json()["results"][0]["result"]
+    assert "distance_nm" not in res
+    assert "ground_speed_kt" not in res
+
+
+def test_motion_guard_normal_motion_fields():
+    # 10 秒内向北约 1.2 海里 => 约 430 节
+    lat1 = 39.9
+    lat2 = lat1 + 1.2 / 60.0
+    payload = {
+        "pairs": [
+            _moving_payload("moving", lat1, 116.4, lat2, 116.4, T0, T0 + 10_000)
+        ],
+        "motion_guard": {"max_ground_speed_kt": 2000},
+    }
+    r = client.post("/api/adsb/positions/decode", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok_count"] == 1 and body["error_count"] == 0
+    res = body["results"][0]["result"]
+    assert res["distance_nm"] == pytest.approx(1.2, abs=1e-3)
+    assert res["ground_speed_kt"] == pytest.approx(432.0, abs=1.0)
+    # 保留三位小数：与 1e-3 网格对齐
+    assert round(res["distance_nm"], 3) == res["distance_nm"]
+    assert round(res["ground_speed_kt"], 3) == res["ground_speed_kt"]
+
+
+def test_motion_guard_limit_exceeded_isolated_and_ordered():
+    """超限组只影响所在组：计数、顺序与其他组均保持。"""
+    good = _moving_payload("ok", 20.0, 100.0, 20.01, 100.0, T0, T0 + 10_000)
+    fast = _moving_payload("fast", 20.0, 100.0, 21.0, 100.0, T0, T0 + 1000)
+    also_ok = _pair_payload("static")
+    payload = {
+        "pairs": [good, fast, also_ok],
+        "motion_guard": {"max_ground_speed_kt": 2000},
+    }
+    r = client.post("/api/adsb/positions/decode", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok_count"] == 2 and body["error_count"] == 1
+    assert [x["id"] for x in body["results"]] == ["ok", "fast", "static"]
+    item = body["results"][1]
+    assert item["status"] == "error"
+    assert item["error"]["code"] == "MOTION_LIMIT_EXCEEDED"
+    assert item["error"]["frame"] is None
+    assert "result" not in item
+    for i in (0, 2):
+        assert body["results"][i]["status"] == "ok"
+        assert "distance_nm" in body["results"][i]["result"]
+
+
+def test_motion_guard_same_timestamp_unresolved():
+    p = _moving_payload("same", 35.0, 139.0, 35.01, 139.0, T0, T0)
+    payload = {
+        "pairs": [p],
+        "motion_guard": {"max_ground_speed_kt": 2000},
+    }
+    r = client.post("/api/adsb/positions/decode", json=payload)
+    body = r.json()
+    assert body["ok_count"] == 0 and body["error_count"] == 1
+    err = body["results"][0]["error"]
+    assert err["code"] == "MOTION_TIME_UNRESOLVED"
+    assert err["frame"] is None
+
+
+def test_motion_guard_threshold_equality_passes():
+    """阈值相等通过：地速 82 节整阈值下，82.x 被拒、精确相等放行由单元测试覆盖；
+    此处固定一个明显低于阈值的报文并以其精确速度为阈值，验证边界放行。"""
+    p = _moving_payload("eq", -10.0, -30.0, -9.99, -30.0, T0, T0 + 1234)
+    # 先用大阈值拿到真实地速（字段为三位小数，服务端裁决并不使用该舍入值）
+    pre = client.post(
+        "/api/adsb/positions/decode",
+        json={"pairs": [p], "motion_guard": {"max_ground_speed_kt": 2000}},
+    ).json()
+    gs = pre["results"][0]["result"]["ground_speed_kt"]
+    # 高一个整节的阈值必然通过
+    r = client.post(
+        "/api/adsb/positions/decode",
+        json={"pairs": [p], "motion_guard": {"max_ground_speed_kt": int(gs) + 1}},
+    )
+    assert r.json()["results"][0]["status"] == "ok"
+
+
+def test_motion_guard_antimeridian_reasonable_speed():
+    """跨日期变更线相邻位置按短弧得到合理速度，高纬 NL=2 带同样成立。"""
+    p = _moving_payload("cross", 86.9, 179.9, 86.9, -179.95, T0, T0 + 1000)
+    r = client.post(
+        "/api/adsb/positions/decode",
+        json={"pairs": [p], "motion_guard": {"max_ground_speed_kt": 2000}},
+    )
+    body = r.json()
+    assert body["ok_count"] == 1, body
+    res = body["results"][0]["result"]
+    assert res["distance_nm"] < 1.0
+    assert res["ground_speed_kt"] < 2000.0
+
+
+@pytest.mark.parametrize("v", [0, -1, 2001, 20000, "fast", 1.5, None])
+def test_motion_guard_bounds_validation(v):
+    payload = {
+        "pairs": [_pair_payload("p")],
+        "motion_guard": {"max_ground_speed_kt": v},
+    }
+    r = client.post("/api/adsb/positions/decode", json=payload)
+    assert r.status_code == 422
+
+
+def test_motion_guard_null_means_disabled():
+    """motion_guard: null 等同于省略，响应无运动字段。"""
+    r = client.post(
+        "/api/adsb/positions/decode",
+        json={"pairs": [_pair_payload("p")], "motion_guard": None},
+    )
+    res = r.json()["results"][0]["result"]
+    assert "distance_nm" not in res
+
+
+def test_motion_guard_does_not_change_upstream_errors():
+    """守卫启用后，上游错误码与帧编号语义不变。"""
+    bad = _pair_payload("bad")
+    raw = bytearray.fromhex(bad["frame2"]["raw_hex"])
+    raw[7] ^= 0x01
+    bad["frame2"]["raw_hex"] = raw.hex().upper()
+    r = client.post(
+        "/api/adsb/positions/decode",
+        json={"pairs": [bad], "motion_guard": {"max_ground_speed_kt": 2000}},
+    )
+    err = r.json()["results"][0]["error"]
+    assert err["code"] == "BAD_CRC" and err["frame"] == 2

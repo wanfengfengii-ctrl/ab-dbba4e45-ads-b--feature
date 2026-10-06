@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # --- 常量 -----------------------------------------------------------------
 
@@ -18,6 +18,10 @@ CRC_POLY = 0xFFF409   # Annex 10 生成多项式（不含最高次 x^24 项）
 
 CPR_DENOM = 1 << 17   # CPR 经纬度字段分母 2^17
 MAX_TIME_DELTA_MS = 10_000
+
+# 1 海里 = 1852 m；WGS-84 平均地球半径 6371008.8 m 折算为海里
+EARTH_RADIUS_NM = 6_371_008.8 / 1_852.0
+MS_PER_HOUR = 3_600_000.0
 
 DF_ADSB = 17
 TC_AIRBORNE_POS_MIN = 9
@@ -139,10 +143,38 @@ class DecodedPosition:
     longitude: float
     newer_frame: int      # 位置取自哪一帧：1 / 2
     time_delta_ms: int
+    # 两帧各自代表的位置（按帧序 1/2）；运动守卫需要逐帧位移
+    latitude_frame1: float = 0.0
+    longitude_frame1: float = 0.0
+    latitude_frame2: float = 0.0
+    longitude_frame2: float = 0.0
+    # 启用运动守卫且通过后填充：未舍入的最短地表位移（海里）与地速（节）
+    distance_nm: float | None = None
+    ground_speed_kt: float | None = None
+
+
+def haversine_distance_nm(
+    lat1: float, lon1: float, lat2: float, lon2: float
+) -> float:
+    """球面上两点的最短（大圆弧）地表距离，单位海里。
+
+    经度差按 [-180,180) 取最短夹角，跨日期变更线的相邻点得到短弧，
+    而不是沿另一方向绕行地球一周。
+    """
+    dlon = math.radians((lon1 - lon2 + 180.0) % 360.0 - 180.0)
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = phi2 - phi1
+    a = (
+        math.sin(dphi / 2.0) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlon / 2.0) ** 2
+    )
+    # 浮点误差可能让 1-a 略负或 a 略大于 1，夹紧到合法区间
+    a = min(1.0, max(0.0, a))
+    return 2.0 * EARTH_RADIUS_NM * math.asin(math.sqrt(a))
 
 
 def decode_global_pair(f1: AirborneFrame, f2: AirborneFrame) -> DecodedPosition:
-    """按 DO-260B 全球 CPR 解出较新一帧的经纬度。"""
+    """按 DO-260B 全球 CPR 同时解出两帧各自的经纬度，主位置取较新帧。"""
     even, odd = (f1, f2) if f1.parity == 0 else (f2, f1)
     # 较新帧取时间戳更大者；两帧同刻时按帧序取 frame1，故用同一对象
     # 比较而非简单比较时间戳（同刻且 frame1 为奇帧时结果会相反）
@@ -172,30 +204,38 @@ def decode_global_pair(f1: AirborneFrame, f2: AirborneFrame) -> DecodedPosition:
             f"两帧纬度带不一致（NL={nl_even} vs NL={nl_odd}），"
             "报文跨过分区分界或时间跨度过大",
         )
-
-    if newer_is_even:
-        lat = r_lat_even
-        nl = nl_even
-        ni = max(nl, 1)
-        xz_newer = xz_even
-    else:
-        lat = r_lat_odd
-        nl = nl_odd
-        ni = max(nl - 1, 1)
-        xz_newer = xz_odd
+    nl = nl_even
 
     m = math.floor(xz_even * (nl - 1) - xz_odd * nl + 0.5)
-    lon = (360.0 / ni) * ((m % ni) + xz_newer)
+    ni_even = max(nl, 1)
+    ni_odd = max(nl - 1, 1)
+    lon_even = (360.0 / ni_even) * ((m % ni_even) + xz_even)
+    lon_odd = (360.0 / ni_odd) * ((m % ni_odd) + xz_odd)
 
-    if not -90.0 <= lat <= 90.0 or lon < 0.0 or lon >= 360.0:
+    if (
+        not -90.0 <= r_lat_even <= 90.0
+        or not -90.0 <= r_lat_odd <= 90.0
+        or not 0.0 <= lon_even < 360.0
+        or not 0.0 <= lon_odd < 360.0
+    ):
         # 公式上的不可能结果，通常源于被纬度带检查漏掉的坏对
         raise ModesError(
             "INVALID_POSITION", "CPR 解算结果超出地球经纬度范围"
         )
 
     # 归一化到 [-180, 180)：180° 与 180° 东侧一律折回西经表示
-    if lon >= 180.0:
-        lon -= 360.0
+    lon_even -= 360.0 if lon_even >= 180.0 else 0.0
+    lon_odd -= 360.0 if lon_odd >= 180.0 else 0.0
+
+    if f1.parity == 0:
+        lat1, lon1, lat2, lon2 = r_lat_even, lon_even, r_lat_odd, lon_odd
+    else:
+        lat1, lon1, lat2, lon2 = r_lat_odd, lon_odd, r_lat_even, lon_even
+
+    if newer_is_even:
+        lat, lon = r_lat_even, lon_even
+    else:
+        lat, lon = r_lat_odd, lon_odd
 
     newer_frame = 1 if f1.recv_ms >= f2.recv_ms else 2
     return DecodedPosition(
@@ -204,15 +244,25 @@ def decode_global_pair(f1: AirborneFrame, f2: AirborneFrame) -> DecodedPosition:
         longitude=lon,
         newer_frame=newer_frame,
         time_delta_ms=abs(f1.recv_ms - f2.recv_ms),
+        latitude_frame1=lat1,
+        longitude_frame1=lon1,
+        latitude_frame2=lat2,
+        longitude_frame2=lon2,
     )
 
 
 # --- 报文对裁决入口 -------------------------------------------------------
 
 def adjudicate(
-    hex1: str, ts1: int, hex2: str, ts2: int
+    hex1: str, ts1: int, hex2: str, ts2: int,
+    max_ground_speed_kt: float | None = None,
 ) -> DecodedPosition:
-    """对一对原始报文执行完整裁决，失败抛 ModesError（带稳定错误码）。"""
+    """对一对原始报文执行完整裁决，失败抛 ModesError（带稳定错误码）。
+
+    max_ground_speed_kt 给定时启用运动守卫：两帧位置解出后，按两帧各自
+    代表的位置计算最短地表位移与地速；同刻无法计时返回
+    MOTION_TIME_UNRESOLVED，超过上限返回 MOTION_LIMIT_EXCEEDED。
+    """
     raw1 = _parse_hex(hex1, 1)
     raw2 = _parse_hex(hex2, 2)
 
@@ -236,7 +286,32 @@ def adjudicate(
             f"两帧接收时间相隔 {delta} ms，超过 {MAX_TIME_DELTA_MS} ms 上限",
         )
 
-    return decode_global_pair(f1, f2)
+    pos = decode_global_pair(f1, f2)
+
+    if max_ground_speed_kt is not None:
+        distance_nm = haversine_distance_nm(
+            pos.latitude_frame1, pos.longitude_frame1,
+            pos.latitude_frame2, pos.longitude_frame2,
+        )
+        if pos.time_delta_ms == 0:
+            # 同刻无法计时：位移再小也算不出地速
+            raise ModesError(
+                "MOTION_TIME_UNRESOLVED",
+                "两帧接收时刻相同，无法计算地速",
+            )
+        ground_speed_kt = distance_nm * MS_PER_HOUR / pos.time_delta_ms
+        # 阈值相等视为通过；一律用未舍入值裁决，禁止拿保留三位小数后的结果比较
+        if ground_speed_kt > max_ground_speed_kt:
+            raise ModesError(
+                "MOTION_LIMIT_EXCEEDED",
+                f"两帧地速 {ground_speed_kt:.3f} kt 超过上限 "
+                f"{max_ground_speed_kt:g} kt",
+            )
+        pos = replace(
+            pos, distance_nm=distance_nm, ground_speed_kt=ground_speed_kt
+        )
+
+    return pos
 
 
 def _parse_hex(text: str, frame: int) -> bytes:
