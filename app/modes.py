@@ -19,6 +19,10 @@ CRC_POLY = 0xFFF409   # Annex 10 生成多项式（不含最高次 x^24 项）
 CPR_DENOM = 1 << 17   # CPR 经纬度字段分母 2^17
 MAX_TIME_DELTA_MS = 10_000
 
+# 1 海里定义为球面上 1 角分大圆弧长，故平均地球半径取 R = 180*60/π 海里
+EARTH_RADIUS_NM = 180.0 * 60.0 / math.pi
+MS_PER_HOUR = 3_600_000
+
 DF_ADSB = 17
 TC_AIRBORNE_POS_MIN = 9
 TC_AIRBORNE_POS_MAX = 18  # DO-260B：BDS 0,5 空中位置 TC 9..18（TC19 为空速）
@@ -133,12 +137,25 @@ def parse_airborne_frame(raw: bytes, recv_ms: int, frame: int) -> AirborneFrame:
 # --- 全球 CPR 解码 --------------------------------------------------------
 
 @dataclass(frozen=True)
+class FramePosition:
+    """一帧经全球 CPR 解算后各自代表的位置（同一对带索引下的候选）。"""
+
+    frame: int           # 原始帧序：1 / 2
+    latitude: float
+    longitude: float     # 已归一化到 [-180, 180)
+    recv_ms: int
+
+
+@dataclass(frozen=True)
 class DecodedPosition:
     icao: int
     latitude: float
     longitude: float
     newer_frame: int      # 位置取自哪一帧：1 / 2
     time_delta_ms: int
+    # 两帧各自代表的位置（同一纬度带索引解），供运动合理性裁决使用
+    pos1: FramePosition | None = None
+    pos2: FramePosition | None = None
 
 
 def decode_global_pair(f1: AirborneFrame, f2: AirborneFrame) -> DecodedPosition:
@@ -174,18 +191,23 @@ def decode_global_pair(f1: AirborneFrame, f2: AirborneFrame) -> DecodedPosition:
         )
 
     if newer_is_even:
-        lat = r_lat_even
-        nl = nl_even
-        ni = max(nl, 1)
+        ni_newer = max(nl_even, 1)
         xz_newer = xz_even
     else:
-        lat = r_lat_odd
-        nl = nl_odd
-        ni = max(nl - 1, 1)
+        ni_newer = max(nl_odd - 1, 1)
         xz_newer = xz_odd
 
+    # nl_even == nl_odd（上面已校验），m 用该共同纬度带数
+    nl = nl_even
     m = math.floor(xz_even * (nl - 1) - xz_odd * nl + 0.5)
-    lon = (360.0 / ni) * ((m % ni) + xz_newer)
+
+    # 两帧各自代表的位置（同一带索引解），供运动守卫使用
+    ni_even, ni_odd = max(nl_even, 1), max(nl_odd - 1, 1)
+    lon_even = (360.0 / ni_even) * ((m % ni_even) + xz_even)
+    lon_odd = (360.0 / ni_odd) * ((m % ni_odd) + xz_odd)
+
+    lat = r_lat_even if newer_is_even else r_lat_odd
+    lon = (360.0 / ni_newer) * ((m % ni_newer) + xz_newer)
 
     if not -90.0 <= lat <= 90.0 or lon < 0.0 or lon >= 360.0:
         # 公式上的不可能结果，通常源于被纬度带检查漏掉的坏对
@@ -197,6 +219,16 @@ def decode_global_pair(f1: AirborneFrame, f2: AirborneFrame) -> DecodedPosition:
     if lon >= 180.0:
         lon -= 360.0
 
+    def _norm_lon(v: float) -> float:
+        return v - 360.0 if v >= 180.0 else v
+
+    if f1.parity == 0:
+        pos1 = FramePosition(1, r_lat_even, _norm_lon(lon_even), f1.recv_ms)
+        pos2 = FramePosition(2, r_lat_odd, _norm_lon(lon_odd), f2.recv_ms)
+    else:
+        pos1 = FramePosition(1, r_lat_odd, _norm_lon(lon_odd), f1.recv_ms)
+        pos2 = FramePosition(2, r_lat_even, _norm_lon(lon_even), f2.recv_ms)
+
     newer_frame = 1 if f1.recv_ms >= f2.recv_ms else 2
     return DecodedPosition(
         icao=f1.icao,
@@ -204,15 +236,45 @@ def decode_global_pair(f1: AirborneFrame, f2: AirborneFrame) -> DecodedPosition:
         longitude=lon,
         newer_frame=newer_frame,
         time_delta_ms=abs(f1.recv_ms - f2.recv_ms),
+        pos1=pos1,
+        pos2=pos2,
     )
 
 
 # --- 报文对裁决入口 -------------------------------------------------------
 
+def haversine_nm(
+    lat1: float, lon1: float, lat2: float, lon2: float
+) -> float:
+    """两点间最短地表（大圆弧）距离，单位海里。
+
+    经度差按 [-180,180] 取最短夹角，跨日期变更线相邻位置走短弧，
+    不会被当成绕行地球一周的大跃迁。
+    """
+    dlon = math.radians((lon1 - lon2 + 180.0) % 360.0 - 180.0)
+    dlat = math.radians(lat1 - lat2)
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    h = (
+        math.sin(dlat / 2.0) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlon / 2.0) ** 2
+    )
+    # 浮点误差可能使 h 略微超出 [0,1]
+    h = min(1.0, max(0.0, h))
+    return 2.0 * EARTH_RADIUS_NM * math.asin(math.sqrt(h))
+
+
 def adjudicate(
-    hex1: str, ts1: int, hex2: str, ts2: int
+    hex1: str,
+    ts1: int,
+    hex2: str,
+    ts2: int,
+    max_ground_speed_kt: int | None = None,
 ) -> DecodedPosition:
-    """对一对原始报文执行完整裁决，失败抛 ModesError（带稳定错误码）。"""
+    """对一对原始报文执行完整裁决，失败抛 ModesError（带稳定错误码）。
+
+    max_ground_speed_kt 给定时启用运动合理性守卫：按两帧各自代表的位置
+    计算最短地表位移与地速，等于阈值视为通过，裁决使用未舍入值。
+    """
     raw1 = _parse_hex(hex1, 1)
     raw2 = _parse_hex(hex2, 2)
 
@@ -236,7 +298,47 @@ def adjudicate(
             f"两帧接收时间相隔 {delta} ms，超过 {MAX_TIME_DELTA_MS} ms 上限",
         )
 
-    return decode_global_pair(f1, f2)
+    pos = decode_global_pair(f1, f2)
+
+    if max_ground_speed_kt is not None:
+        guard_motion(pos, max_ground_speed_kt)
+
+    return pos
+
+
+def motion_estimate(pos: DecodedPosition) -> tuple[float, float]:
+    """按两帧各自代表的位置返回 (最短地表距离 nm, 地速 kt)。
+
+    两帧接收时刻相同（时间间隔为零）时无法计算地速，抛
+    MOTION_TIME_UNRESOLVED。
+    """
+    assert pos.pos1 is not None and pos.pos2 is not None
+    dt_ms = abs(pos.pos1.recv_ms - pos.pos2.recv_ms)
+    if dt_ms == 0:
+        raise ModesError(
+            "MOTION_TIME_UNRESOLVED",
+            "两帧接收时刻相同，时间间隔为零，无法计算地速",
+        )
+    distance_nm = haversine_nm(
+        pos.pos1.latitude,
+        pos.pos1.longitude,
+        pos.pos2.latitude,
+        pos.pos2.longitude,
+    )
+    ground_speed_kt = distance_nm * MS_PER_HOUR / dt_ms
+    return distance_nm, ground_speed_kt
+
+
+def guard_motion(pos: DecodedPosition, max_ground_speed_kt: int) -> None:
+    """对已解算的报文对做地速守卫，超限/不可计算时抛 ModesError。"""
+    distance_nm, ground_speed_kt = motion_estimate(pos)
+    # 阈值相等视为通过；一律用未舍入值裁决
+    if ground_speed_kt > max_ground_speed_kt:
+        raise ModesError(
+            "MOTION_LIMIT_EXCEEDED",
+            f"两帧位移 {distance_nm:.3f} nm / {abs(pos.pos1.recv_ms - pos.pos2.recv_ms)} ms，"
+            f"地速 {ground_speed_kt:.3f} kt 超过上限 {max_ground_speed_kt} kt",
+        )
 
 
 def _parse_hex(text: str, frame: int) -> bytes:

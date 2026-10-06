@@ -88,6 +88,36 @@ def make_pair(
     return (t_even_ms, even.hex().upper()), (t_odd_ms, odd.hex().upper())
 
 
+def make_motion_pair(
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+    icao: int = 0x780A1B,
+    t_even_ms: int = 1_000_000,
+    t_odd_ms: int | None = None,
+) -> tuple[tuple[int, str], tuple[int, str]]:
+    """生成两帧各自编码*不同*位置的偶/奇报文对，用于运动/错配场景。
+
+    与 make_pair 不同：偶帧编码 (lat1,lon1)、奇帧编码 (lat2,lon2)。
+    全球解算要求两位置处于同一纬度带（NL 一致）。
+    """
+    from app.modes import cpr_nl
+
+    if t_odd_ms is None:
+        t_odd_ms = t_even_ms + 500
+    nl1, nl2 = cpr_nl(lat1), cpr_nl(lat2)
+    if nl1 != nl2:
+        raise ValueError(
+            f"两位置纬度带不一致：NL={nl1} vs NL={nl2}，无法配成全球 CPR 对"
+        )
+    yz0, xz0 = encode_cpr(lat1, lon1, 0, nl1)
+    yz1, xz1 = encode_cpr(lat2, lon2, 1, nl2)
+    even = make_airborne_msg(icao, yz0, xz0, 0)
+    odd = make_airborne_msg(icao, yz1, xz1, 1)
+    return (t_even_ms, even.hex().upper()), (t_odd_ms, odd.hex().upper())
+
+
 def angular_lon_diff(a: float, b: float) -> float:
     """两个经度之间的最小夹角（度），跨 ±180 回绕安全。"""
     return abs((a - b + 180.0) % 360.0 - 180.0)
