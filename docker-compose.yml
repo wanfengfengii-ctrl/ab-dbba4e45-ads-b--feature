@@ -1,0 +1,37 @@
+services:
+  # 常驻 API 服务：宿主机端口由 HOST_PORT 环境变量配置（默认 8080）
+  api:
+    build:
+      context: .
+      target: runtime
+    image: adsb-positions-api:latest
+    ports:
+      # 宿主机端口可配置：HOST_PORT=9090 docker compose up
+      - "${HOST_PORT:-8080}:8000"
+    environment:
+      UVICORN_LOG_LEVEL: "${LOG_LEVEL:-info}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+
+  # 一次性校验服务：pytest -> 等待 API 健康 -> 接口冒烟，随后自行退出，
+  # 退出码即整体裁决结果。镜像构建由 compose 在启动服务前完成，
+  # 构建失败时本服务不会启动且整条命令以非零码退出。
+  verify:
+    build:
+      context: .
+      target: test
+    image: adsb-positions-verify:latest
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_BASE_URL: "http://api:8000"
+    restart: "no"
